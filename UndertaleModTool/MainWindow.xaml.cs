@@ -1,7 +1,6 @@
 ﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Scripting;
 using Microsoft.CodeAnalysis.Scripting;
-using Microsoft.CodeAnalysis.Scripting.Hosting;
 using Microsoft.Win32;
 using Newtonsoft.Json;
 using System;
@@ -33,11 +32,8 @@ using UndertaleModTool.Windows;
 using System.IO.Pipes;
 using Ookii.Dialogs.Wpf;
 
-using ColorConvert = System.Windows.Media.ColorConverter;
 using System.Text.RegularExpressions;
 using System.Windows.Data;
-using System.Reflection.Metadata.Ecma335;
-using System.Windows.Media.Imaging;
 using System.Security.Cryptography;
 using System.Collections.Concurrent;
 using System.Runtime;
@@ -49,8 +45,8 @@ using System.Net;
 using System.Globalization;
 using System.Windows.Controls.Primitives;
 using System.Runtime.CompilerServices;
-using System.Diagnostics.Metrics;
 using System.Windows.Interop;
+using System.Windows.Media.Imaging;
 
 namespace UndertaleModTool
 {
@@ -106,6 +102,9 @@ namespace UndertaleModTool
 
         public List<Tab> ClosedTabsHistory { get; } = new();
 
+        private List<(GMImage, WeakReference<BitmapSource>)> _bitmapSourceLookup { get; } = new();
+        private object _bitmapSourceLookupLock = new();
+
         public bool CanSave { get; set; }
         public bool CanSafelySave = false;
         public bool WasWarnedAboutTempRun = false;
@@ -116,12 +115,6 @@ namespace UndertaleModTool
         public string ExePath { get; private set; } = Program.GetExecutableDirectory();
         public string ScriptErrorType { get; set; } = "";
 
-        public enum CodeEditorMode
-        {
-            Unstated,
-            DontDecompile,
-            Decompile
-        }
         public enum SaveResult
         {
             NotSaved,
@@ -133,9 +126,6 @@ namespace UndertaleModTool
             Left,
             Right
         }
-
-        // TODO: move this to the code editor
-        public static CodeEditorMode CodeEditorDecompile { get; set; } = CodeEditorMode.Unstated;
 
         private int progressValue;
         private Task updater;
@@ -211,7 +201,7 @@ namespace UndertaleModTool
         public static string Edition = "(Git: " + GitVersion.GetGitVersion().Substring(0, 7) + ")";
 
         // On debug, build with git versions and provided release version. Otherwise, use the provided release version only.
-#if DEBUG
+#if DEBUG || SHOW_COMMIT_HASH
         public static string Version = Assembly.GetExecutingAssembly().GetName().Version.ToString() + (Edition != "" ? " - " + Edition : "");
 #else
         public static string Version = Assembly.GetExecutingAssembly().GetName().Version.ToString();
@@ -258,7 +248,8 @@ namespace UndertaleModTool
                                 .AddReferences(typeof(UndertaleObject).GetTypeInfo().Assembly,
                                                 GetType().GetTypeInfo().Assembly,
                                                 typeof(JsonConvert).GetTypeInfo().Assembly,
-                                                typeof(System.Text.RegularExpressions.Regex).GetTypeInfo().Assembly)
+                                                typeof(System.Text.RegularExpressions.Regex).GetTypeInfo().Assembly,
+                                                typeof(ImageMagick.MagickImage).GetTypeInfo().Assembly)
                                 .WithEmitDebugInformation(true); //when script throws an exception, add a exception location (line number)
             });
 
@@ -266,6 +257,46 @@ namespace UndertaleModTool
             resources["CustomTextBrush"] = SystemColors.ControlTextBrush;
             resources[SystemColors.GrayTextBrushKey] = grayTextBrush;
             resources[SystemColors.InactiveSelectionHighlightBrushKey] = inactiveSelectionBrush;
+        }
+
+        /// <summary>
+        /// Returns a <see cref="BitmapSource"/> instance for the given <see cref="GMImage"/>.
+        /// If a previously-created instance has not yet been garbage collected, this will return that instance.
+        /// </summary>
+        public BitmapSource GetBitmapSourceForImage(GMImage image)
+        {
+            lock (_bitmapSourceLookupLock)
+            {
+                // Look through entire list, clearing out old weak references, and potentially finding our desired source
+                BitmapSource foundSource = null;
+                for (int i = _bitmapSourceLookup.Count - 1; i >= 0; i--)
+                {
+                    (GMImage imageKey, WeakReference<BitmapSource> referenceVal) = _bitmapSourceLookup[i];
+                    if (!referenceVal.TryGetTarget(out BitmapSource source))
+                    {
+                        // Clear out old weak reference
+                        _bitmapSourceLookup.RemoveAt(i);
+                    }
+                    else if (imageKey == image)
+                    {
+                        // Found our source, store it to return later
+                        foundSource = source;
+                    }
+                }
+
+                // If we found our source, return it
+                if (foundSource is not null)
+                {
+                    return foundSource;
+                }
+
+                // If no source was found, then create a new one
+                byte[] pixelData = image.ConvertToRawBgra().ToSpan().ToArray();
+                BitmapSource bitmap = BitmapSource.Create(image.Width, image.Height, 96, 96, PixelFormats.Bgra32, null, pixelData, image.Width * 4);
+                bitmap.Freeze();
+                _bitmapSourceLookup.Add((image, new WeakReference<BitmapSource>(bitmap)));
+                return bitmap;
+            }
         }
 
         private void SetIDString(string str)
@@ -789,54 +820,49 @@ namespace UndertaleModTool
 
                 if (SettingsWindow.WarnOnClose)
                 {
-                    if (this.ShowQuestion("Are you sure you want to quit?") == MessageBoxResult.Yes)
+                    MessageBoxResult result = this.ShowQuestionWithCancel("Save changes before quitting?");
+
+                    if (result == MessageBoxResult.Cancel)
                     {
-                        if (this.ShowQuestion("Save changes first?") == MessageBoxResult.Yes)
-                        {
-                            if (scriptDialog is not null)
-                            {
-                                if (this.ShowQuestion("Script still runs. Save anyway?\nIt can corrupt the data file that you'll save.") == MessageBoxResult.Yes)
-                                    save = true;
-                            }
-                            else
-                                save = true;
-
-                            if (save)
-                            {
-                                SaveResult saveRes = await SaveCodeChanges();
-
-                                if (saveRes == SaveResult.NotSaved)
-                                    _ = DoSaveDialog();
-                                else if (saveRes == SaveResult.Error)
-                                {
-                                    this.ShowError("The changes in code editor weren't saved due to some error in \"SaveCodeChanges()\".");
-                                    return;
-                                }
-                            }
-                        }
-                        else
-                            RevertProfile();
-
-                        DestroyUMTLastEdited();
-                    }
-                    else
                         return;
+                    }
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        if (scriptDialog is null || (this.ShowQuestion("Script still runs. Save anyway?\nIt can corrupt the data file that you'll save.") == MessageBoxResult.Yes))
+                            save = true;
+                    }
+                }
+
+                if (save)
+                {
+                    SaveResult saveRes = await SaveCodeChanges();
+
+                    if (saveRes == SaveResult.NotSaved)
+                    {
+                        _ = DoSaveDialog();
+                    }
+                    else if (saveRes == SaveResult.Error)
+                    {
+                        this.ShowError("The changes in code editor weren't saved due to some error in \"SaveCodeChanges()\".");
+                        return;
+                    }
                 }
                 else
                 {
                     RevertProfile();
-                    DestroyUMTLastEdited();
                 }
 
-                if (SettingsWindow.UseGMLCache && Data?.GMLCache?.Count > 0 && !Data.GMLCacheWasSaved && Data.GMLCacheIsReady)
-                    if (this.ShowQuestion("Save unedited code cache?") == MessageBoxResult.Yes)
-                        await SaveGMLCache(FilePath, save);
+                DestroyUMTLastEdited();
+
+                if (SettingsWindow.UseGMLCache && Data?.GMLCache?.Count > 0 && !Data.GMLCacheWasSaved && Data.GMLCacheIsReady && this.ShowQuestion("Save unedited code cache?") == MessageBoxResult.Yes)
+                    await SaveGMLCache(FilePath, save);
 
                 CloseOtherWindows();
 
                 IsAppClosed = true;
 
-                Closing -= DataWindow_Closing; //disable "on window closed" event handler (prevent recursion)
+                Closing -= DataWindow_Closing; // Disable "on window closed" event handler (prevent recursion)
                 _ = Task.Run(() => Dispatcher.Invoke(Close));
             }
         }
@@ -957,7 +983,6 @@ namespace UndertaleModTool
                         data = UndertaleIO.Read(stream, warning =>
                         {
                             this.ShowWarning(warning, "Loading warning");
-
                             if (warning.Contains("unserializeCountError.txt")
                                 || warning.Contains("object pool size"))
                                 return;
@@ -968,11 +993,12 @@ namespace UndertaleModTool
                             FileMessageEvent?.Invoke(message);
                         }, onlyGeneralInfo);
                     }
-
-                    UndertaleEmbeddedTexture.TexData.ClearSharedStream();
                 }
                 catch (Exception e)
                 {
+#if DEBUG
+                    Debug.WriteLine(e);
+#endif
                     this.ShowError("An error occured while trying to load:\n" + e.Message, "Load error");
                 }
 
@@ -1100,7 +1126,6 @@ namespace UndertaleModTool
                         });
                     }
 
-                    UndertaleEmbeddedTexture.TexData.ClearSharedStream();
                     QoiConverter.ClearSharedBuffer();
 
                     if (debugMode != DebugDataDialog.DebugDataMode.NoDebug)
@@ -1147,7 +1172,7 @@ namespace UndertaleModTool
                                 {
                                     if (debugMode == DebugDataDialog.DebugDataMode.FullAssembler || instr.Kind == UndertaleInstruction.Opcode.Pop || instr.Kind == UndertaleInstruction.Opcode.Popz || instr.Kind == UndertaleInstruction.Opcode.B || instr.Kind == UndertaleInstruction.Opcode.Bt || instr.Kind == UndertaleInstruction.Opcode.Bf || instr.Kind == UndertaleInstruction.Opcode.Ret || instr.Kind == UndertaleInstruction.Opcode.Exit)
                                         debugInfo.Add(new UndertaleDebugInfo.DebugInfoPair() { SourceCodeOffset = (uint)sb.Length, BytecodeOffset = instr.Address * 4 });
-                                    sb.Append(instr.ToString(code));
+                                    instr.ToString(sb, code);
                                     sb.Append('\n');
                                 }
                                 outputs[i] = sb.ToString();
@@ -1857,7 +1882,17 @@ namespace UndertaleModTool
                 name = StringTitleConverter.Instance.Convert(str.Content, null, null, null) as string;
 
             if (name is not null)
-                Clipboard.SetText(name);
+            {
+                try
+                {
+                    Clipboard.SetText(name);
+                }
+                catch (Exception ex)
+                {
+                    this.ShowError("Can't copy the item name to clipboard due to this error:\n" +
+                                   ex.Message + ".\nYou probably should try again.");
+                }
+            }
             else
                 this.ShowWarning("Item name is null.");
         }
@@ -2013,7 +2048,7 @@ namespace UndertaleModTool
 
         private void MenuItem_Add_Click(object sender, RoutedEventArgs e)
         {
-            object source = null;
+            object source;
             try
             {
                 source = (MainTree.SelectedItem as TreeViewItem).ItemsSource;
@@ -2048,11 +2083,20 @@ namespace UndertaleModTool
                 {
                     notDataNewName = "Texture " + list.Count;
                 }
+                if (obj is UndertaleShader shader)
+                {
+                    shader.GLSL_ES_Vertex = Data.Strings.MakeString("", true);
+                    shader.GLSL_ES_Fragment = Data.Strings.MakeString("", true);
+                    shader.GLSL_Vertex = Data.Strings.MakeString("", true);
+                    shader.GLSL_Fragment = Data.Strings.MakeString("", true);
+                    shader.HLSL9_Vertex = Data.Strings.MakeString("", true);
+                    shader.HLSL9_Fragment = Data.Strings.MakeString("", true);
+                }
 
                 if (doMakeString)
                 {
-                    string newname = obj.GetType().Name.Replace("Undertale", "").Replace("GameObject", "Object").ToLower() + list.Count;
-                    (obj as UndertaleNamedResource).Name = Data.Strings.MakeString(newname);
+                    string newName = obj.GetType().Name.Replace("Undertale", "").Replace("GameObject", "Object").ToLower() + list.Count;
+                    (obj as UndertaleNamedResource).Name = Data.Strings.MakeString(newName);
                     if (obj is UndertaleRoom)
                     {
                         (obj as UndertaleRoom).Caption = Data.Strings.MakeString("");
@@ -2065,7 +2109,7 @@ namespace UndertaleModTool
                     {
                         UndertaleCode code = new UndertaleCode();
                         string prefix = Data.IsVersionAtLeast(2, 3) ? "gml_GlobalScript_" : "gml_Script_";
-                        code.Name = Data.Strings.MakeString(prefix + newname);
+                        code.Name = Data.Strings.MakeString(prefix + newName);
                         Data.Code.Add(code);
                         if (Data?.GeneralInfo.BytecodeVersion > 14)
                         {
@@ -2080,7 +2124,7 @@ namespace UndertaleModTool
                         }
                         (obj as UndertaleScript).Code = code;
                     }
-                    if ((obj is UndertaleCode) && (Data?.GeneralInfo.BytecodeVersion > 14))
+                    if ((obj is UndertaleCode) && (Data.GeneralInfo.BytecodeVersion > 14))
                     {
                         UndertaleCodeLocals locals = new UndertaleCodeLocals();
                         locals.Name = (obj as UndertaleCode).Name;
@@ -2421,7 +2465,11 @@ namespace UndertaleModTool
                 updater.Dispose();
         }
 
-        public void OpenCodeFile(string name, CodeEditorMode editorDecompile, bool inNewTab = false)
+        public void OpenCodeEntry(string name, UndertaleCodeEditor.CodeEditorTab editorTab, bool inNewTab = false)
+        {
+            OpenCodeEntry(name, -1, editorTab, inNewTab);
+        }
+        public void OpenCodeEntry(string name, int lineNum, UndertaleCodeEditor.CodeEditorTab editorTab, bool inNewTab = false)
         {
             UndertaleCode code = Data.Code.ByName(name);
 
@@ -2429,58 +2477,69 @@ namespace UndertaleModTool
             {
                 Focus();
 
+                #pragma warning disable CA1416
                 if (Selected == code)
                 {
-                    #pragma warning disable CA1416
                     var codeEditor = FindVisualChild<UndertaleCodeEditor>(DataEditor);
                     if (codeEditor is null)
                     {
-                        Debug.WriteLine("Cannot select the code editor mode tab - its instance is not found.");
+                        Debug.WriteLine("Cannot select the code editor mode tab - the instance is not found.");
                     }
                     else
                     {
-                        if (editorDecompile == CodeEditorMode.Decompile
+                        if (editorTab == UndertaleCodeEditor.CodeEditorTab.Decompiled
                             && !codeEditor.DecompiledTab.IsSelected)
                         {
                             codeEditor.CodeModeTabs.SelectedItem = codeEditor.DecompiledTab;
                         }
-                        else if (editorDecompile == CodeEditorMode.DontDecompile
+                        else if (editorTab == UndertaleCodeEditor.CodeEditorTab.Disassembly
                             && !codeEditor.DisassemblyTab.IsSelected)
                         {
                             codeEditor.CodeModeTabs.SelectedItem = codeEditor.DisassemblyTab;
                         }
+
+                        var editor = editorTab == UndertaleCodeEditor.CodeEditorTab.Decompiled
+                                     ? codeEditor.DecompiledEditor : codeEditor.DisassemblyEditor;
+                        CurrentTab?.SaveTabContentState();
+                        UndertaleCodeEditor.ChangeLineNumber(lineNum, editor);
                     }
-                    #pragma warning restore CA1416
                 }
                 else
-                    CodeEditorDecompile = editorDecompile;
+                {
+                    if (CurrentTab?.CurrentObject is UndertaleCode)
+                        CurrentTab.SaveTabContentState();
+
+                    UndertaleCodeEditor.EditorTab = editorTab;
+                    UndertaleCodeEditor.ChangeLineNumber(lineNum, editorTab);
+                }
+                #pragma warning restore CA1416
 
                 HighlightObject(code);
                 ChangeSelection(code, inNewTab);
             }
             else
             {
-                this.ShowError($"Can't find code \"{name}\".\n(probably, different game data was loaded)");
+                this.ShowError($"Can't find code entry \"{name}\".\n(probably, different game data was loaded)");
             }
         }
 
-        public string ProcessException(in Exception exc, in string scriptText)
+        public string ProcessException(in Exception exc)
         {
-            List<int> excLineNums = new();
-            string excText = string.Empty;
+            // Collect all original trace lines that we want to parse
             List<string> traceLines = new();
             Dictionary<string, int> exTypesDict = null;
-
             if (exc is AggregateException)
             {
                 List<string> exTypes = new();
 
+                // Collect trace lines of inner exceptions, and track their exception type names
                 foreach (Exception ex in (exc as AggregateException).InnerExceptions)
                 {
                     traceLines.AddRange(ex.StackTrace.Split(Environment.NewLine));
                     exTypes.Add(ex.GetType().FullName);
                 }
 
+                // Create a mapping of each exception type to the number of its occurrences
                 if (exTypes.Count > 1)
                 {
                     exTypesDict = exTypes.GroupBy(x => x)
@@ -2491,23 +2550,35 @@ namespace UndertaleModTool
             }
             else if (exc.InnerException is not null)
             {
+                // Collect trace lines of single inner exception
                 traceLines.AddRange(exc.InnerException.StackTrace.Split(Environment.NewLine));
             }
-
             traceLines.AddRange(exc.StackTrace.Split(Environment.NewLine));
 
+            // Iterate over all lines in the stack trace, finding their line numbers and file names
+            List<(string SourceFile, int LineNum)> loadedScriptLineNums = new();
+            int expectedNumScriptTraceLines = 0;
             try
             {
                 foreach (string traceLine in traceLines)
                 {
-                    if (traceLine.TrimStart()[..13] == "at Submission") // only stack trace lines from the script
+                    // Only handle trace lines that come from a script
+                    if (traceLine.TrimStart()[..13] == "at Submission") 
                     {
-                        int linePos = traceLine.IndexOf(":line ") + 6;  // ":line ".Length = 6
-                        if (linePos != (-1 + 6))
+                        // Add to total count of expected script trace lines
+                        expectedNumScriptTraceLines++;
+
+                        // Get full path of the script file, within the line
+                        string sourceFile = Regex.Match(traceLine, @"(?<=in ).*\.csx(?=:line \d+)").Value;
+                        if (!File.Exists(sourceFile))
+                            continue;
+
+                        // Try to find line number from the line
+                        const string pattern = ":line ";
+                        int linePos = traceLine.IndexOf(pattern);
+                        if (linePos > 0 && int.TryParse(traceLine[(linePos + pattern.Length)..], out int lineNum))
                         {
-                            int lineNum = Convert.ToInt32(traceLine[linePos..]);
-                            if (!excLineNums.Contains(lineNum))
-                                excLineNums.Add(lineNum);
+                            loadedScriptLineNums.Add((sourceFile, lineNum));
                         }
                     }
                 }
@@ -2518,22 +2589,57 @@ namespace UndertaleModTool
 
                 int endOfPrevStack = excString.IndexOf("--- End of stack trace from previous location ---");
                 if (endOfPrevStack != -1)
-                    excString = excString[..endOfPrevStack]; //keep only stack trace of the script
+                {
+                    // Keep only stack trace of the script
+                    excString = excString[..endOfPrevStack];
+                }
 
                 return $"An error occurred while processing the exception text.\nError message - \"{e.Message}\"\nThe unprocessed text is below.\n\n" + excString;
             }
 
-            if (excLineNums.Count > 0) //if line number(s) is found
-            {
-                string[] scriptLines = scriptText.Split('\n');
-                string excLines = string.Join('\n', excLineNums.Select(n => $"Line {n}: {scriptLines[n].TrimStart(new char[] { '\t', ' ' })}"));
+            // Generate final exception text to show.
+            // If we found the expected number of script trace lines, then use them; otherwise, use the regular exception text.
+            string excText;
+            if (loadedScriptLineNums.Count == expectedNumScriptTraceLines)
+            {                
+                // Read the code for the files to know what the code line associated with the stack trace is
+                Dictionary<string, List<string>> scriptsCode = new();
+                foreach ((string sourceFile, int _) in loadedScriptLineNums)
+                {
+                    if (!scriptsCode.ContainsKey(sourceFile))
+                    {
+                        string scriptCode = null;
+                        try
+                        {
+                            scriptCode = File.ReadAllText(sourceFile, Encoding.UTF8);
+                        }
+                        catch (Exception e)
+                        {
+                            string excString = exc.ToString();
+
+                            return $"An error occurred while processing the exception text.\nError message - \"{e.Message}\"\nThe unprocessed text is below.\n\n" + excString;
+                        }
+                        scriptsCode.Add(sourceFile, scriptCode.Split('\n').ToList());
+                    }
+                }
+
+                // Generate custom stack trace
+                string excLines = string.Join('\n', loadedScriptLineNums.Select(pair =>
+                {
+                    string scriptName = Path.GetFileName(pair.SourceFile);
+                    string scriptLine = scriptsCode[pair.SourceFile][pair.LineNum - 1]; // - 1 because line numbers start from 1
+                    return $"Line {pair.LineNum} in script {scriptName}: {scriptLine}"; 
+                }));
+
                 if (exTypesDict is not null)
                 {
                     string exTypesStr = string.Join(",\n", exTypesDict.Select(x => $"{x.Key}{((x.Value > 1) ? " (x" + x.Value + ")" : string.Empty)}"));
                     excText = $"{exc.GetType().FullName}: One on more errors occured:\n{exTypesStr}\n\nThe current stacktrace:\n{excLines}";
                 }
                 else
+                {
                     excText = $"{exc.GetType().FullName}: {exc.Message}\n\nThe current stacktrace:\n{excLines}";
+                }
             }
             else
             {
@@ -2541,7 +2647,10 @@ namespace UndertaleModTool
 
                 int endOfPrevStack = excString.IndexOf("--- End of stack trace from previous location ---");
                 if (endOfPrevStack != -1)
-                    excString = excString[..endOfPrevStack]; //keep only stack trace of the script
+                {
+                    // Keep only stack trace of the script
+                    excString = excString[..endOfPrevStack];
+                }
 
                 excText = excString;
             }
@@ -2574,8 +2683,7 @@ namespace UndertaleModTool
 
         private async Task RunScriptNow(string path)
         {
-            string scriptText = $"#line 1 \"{path}\"\n" + File.ReadAllText(path);
-            Debug.WriteLine(path);
+            string scriptText = $"#line 1 \"{path}\"\n" + File.ReadAllText(path, Encoding.UTF8);
 
             Dispatcher.Invoke(() => CommandBox.Text = "Running " + Path.GetFileName(path) + " ...");
             try
@@ -2586,7 +2694,7 @@ namespace UndertaleModTool
                 ScriptPath = path;
 
                 string compatScriptText = Regex.Replace(scriptText, @"\bDecompileContext(?!\.)\b", "GlobalDecompileContext", RegexOptions.None);
-                object result = await CSharpScript.EvaluateAsync(compatScriptText, scriptOptions, this, typeof(IScriptInterface));
+                object result = await CSharpScript.EvaluateAsync(compatScriptText, scriptOptions.WithFilePath(path).WithFileEncoding(Encoding.UTF8), this, typeof(IScriptInterface));
 
                 if (FinishedMessageEnabled)
                 {
@@ -2612,7 +2720,7 @@ namespace UndertaleModTool
                 string excString = string.Empty;
 
                 if (!isScriptException)
-                    excString = ProcessException(in exc, in scriptText);
+                    excString = ProcessException(in exc);
 
                 await StopProgressBarUpdater();
 
@@ -2718,7 +2826,7 @@ namespace UndertaleModTool
             TextInput textOutput = new TextInput(labelText, titleText, message, isMultiline, true); //read-only mode
             textOutput.Show();
         }
-        public async Task ClickableSearchOutput(string title, string query, int resultsCount, IOrderedEnumerable<KeyValuePair<string, List<string>>> resultsDict, bool showInDecompiledView, IOrderedEnumerable<string> failedList = null)
+        public async Task ClickableSearchOutput(string title, string query, int resultsCount, IOrderedEnumerable<KeyValuePair<string, List<(int lineNum, string codeLine)>>> resultsDict, bool showInDecompiledView, IOrderedEnumerable<string> failedList = null)
         {
             await Task.Delay(150); //wait until progress bar status is displayed
 
@@ -2731,7 +2839,7 @@ namespace UndertaleModTool
 
             PlayInformationSound();
         }
-        public async Task ClickableSearchOutput(string title, string query, int resultsCount, IDictionary<string, List<string>> resultsDict, bool showInDecompiledView, IEnumerable<string> failedList = null)
+        public async Task ClickableSearchOutput(string title, string query, int resultsCount, IDictionary<string, List<(int lineNum, string codeLine)>> resultsDict, bool showInDecompiledView, IEnumerable<string> failedList = null)
         {
             await Task.Delay(150);
 
@@ -2767,12 +2875,12 @@ namespace UndertaleModTool
 
         private void MenuItem_GitHub_Click(object sender, RoutedEventArgs e)
         {
-            OpenBrowser("https://github.com/krzys-h/UndertaleModTool");
+            OpenBrowser("https://github.com/UnderminersTeam/UndertaleModTool");
         }
 
         private void MenuItem_About_Click(object sender, RoutedEventArgs e)
         {
-            this.ShowMessage("UndertaleModTool by krzys_h\nVersion " + Version, "About");
+            this.ShowMessage("UndertaleModTool by krzys_h and the Underminers team\nVersion " + Version, "About");
         }
 
         /// From https://github.com/AvaloniaUI/Avalonia/blob/master/src/Avalonia.Dialogs/AboutAvaloniaDialog.xaml.cs
@@ -2887,7 +2995,7 @@ namespace UndertaleModTool
             bool isBundled = !Regex.Match(assemblyLocation, @"C:\\Program Files( \(x86\))*\\dotnet\\shared\\").Success;
             string patchName = $"GUI-windows-latest-{configStr}-isBundled-{isBundled.ToString().ToLower()}-isSingleFile-{isSingleFile.ToString().ToLower()}";
 
-            string baseUrl = "https://api.github.com/repos/krzys-h/UndertaleModTool/actions/";
+            string baseUrl = "https://api.github.com/repos/UnderminersTeam/UndertaleModTool/actions/";
             string detectedActionName = "Publish continuous release of UndertaleModTool";
 
             // Fetch the latest workflow run
@@ -3051,7 +3159,7 @@ namespace UndertaleModTool
 
                     // Unzip double-zipped update
                     ZipFile.ExtractToDirectory(Path.Combine(tempFolder, "Update.zip.zip"), tempFolder, true);
-                    File.Move(Path.Combine(tempFolder, $"{patchName}.zip"), Path.Combine(tempFolder, "Update.zip"));
+                    File.Move(Path.Combine(tempFolder, $"{patchName}.zip"), Path.Combine(tempFolder, "Update.zip"), true);
                     File.Delete(Path.Combine(tempFolder, "Update.zip.zip"));
 
                     string updaterFolder = Path.Combine(ExePath, "Updater");
